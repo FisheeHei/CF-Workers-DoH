@@ -264,10 +264,12 @@ async function queryDns(dohServer, domain, type) {
   dohUrl.searchParams.set("type", type);
 
   // 检查 DNS 缓存
-  const cacheKey = new Request(`https://doh-cache.local/${encodeURIComponent(dohServer)}/${encodeURIComponent(domain)}/${type}`);
-  const cachedResponse = await caches.default.match(cacheKey);
-  if (cachedResponse) return cachedResponse.json();
-
+  // 检查 DNS 缓存（失败则跳过，不影响查询）
+  try {
+    const cacheKey = new Request(`https://doh-cache.local/${encodeURIComponent(dohServer)}/${encodeURIComponent(domain)}/${type}`);
+    const cachedResponse = await caches.default.match(cacheKey);
+    if (cachedResponse) return cachedResponse.json();
+  } catch (e) { /* 缓存不可用时跳过 */ }
   // 并行尝试多种请求头，首个成功即返回
   const attempts = [
     { headers: { Accept: "application/dns-json" } },
@@ -302,7 +304,7 @@ async function queryDns(dohServer, domain, type) {
   const cr = new Response(JSON.stringify(result), {
     headers: { "Content-Type": "application/json", "Cache-Control": `max-age=${ttl}` }
   });
-  await caches.default.put(cacheKey, cr);
+  try { await caches.default.put(cacheKey, cr); } catch (e) { /* 缓存写入失败，忽略 */ }
   return result;
 }
 
@@ -420,7 +422,8 @@ async function DOHRequest(request) {
         ]);
       } catch (e) {
         response = (e instanceof AggregateError && e.errors[0] instanceof Response)
-          ? e.errors[0] : await fetch(dnsDoH + searchDoH, fOpts);
+          ? e.errors[0]
+          : new Response("DoH 上游全部不可用", { status: 502 });
       }
     } else if (method === 'GET') {
       // 处理 base64url 格式的 GET 请求
@@ -1629,7 +1632,7 @@ async function 代理URL(代理网址, 目标网址) {
 async function 整理(内容) {
   // 将制表符、双引号、单引号和换行符都替换为逗号
   // 然后将连续的多个逗号替换为单个逗号
-  let 替换后的内容 = 内容.replace(/[	|"'\r\n]+/g, ',').replace(/,+/g, ',');
+  let 替换后的内容 = 内容.replace(/[	"'\r\n]+/g, ',').replace(/,+/g, ',');
 
   // 删除开头和结尾的逗号（如果有的话）
   if (替换后的内容.charAt(0) == ',') 替换后的内容 = 替换后的内容.slice(1);
