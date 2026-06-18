@@ -1013,6 +1013,7 @@ async function HTML() {
       <p><strong>DNS-over-HTTPS：<span id="dohUrlDisplay" class="copy-link" title="点击复制">https://<span
               id="currentDomain">...</span>/${DoH路径}</span></strong><br>基于 Cloudflare Workers 上游 ${DoH} 的 DoH (DNS over HTTPS)
         解析服务<br><small style="color:#888">版本: ${版本号}</small></p>
+      <p><small style="color:#888">Modified by <a href="https://github.com/FisheeHei/CF-Workers-DoH/tree/custom-fix" target="_blank" style="color:#888">FisheeHei + custom-fix</a></small></p>
     </div>
   </div>
 
