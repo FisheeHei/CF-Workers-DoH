@@ -75,7 +75,7 @@ export default {
 
       try {
         // 使用Worker代理请求IP API
-        const response = await fetch(`https://ip-api.com/json/${ip}?lang=zh-CN`);
+        const response = await fetch(`http://ip-api.com/json/${ip}?lang=zh-CN`);
 
         if (!response.ok) {
           throw new Error(`HTTP error: ${response.status}`);
