@@ -2,6 +2,8 @@
 let dnsDoH = `https://${DoH}/dns-query`;
 let jsonDoH = `https://${DoH}/resolve`;
 let DoH路径 = 'dns-query';
+const 版本号 = "custom-fix-20260619-parallel-cache";
+
 export default {
   async fetch(request, env) {
     if (env.DOH) {
@@ -1010,7 +1012,7 @@ async function HTML() {
     <div class="beian-info">
       <p><strong>DNS-over-HTTPS：<span id="dohUrlDisplay" class="copy-link" title="点击复制">https://<span
               id="currentDomain">...</span>/${DoH路径}</span></strong><br>基于 Cloudflare Workers 上游 ${DoH} 的 DoH (DNS over HTTPS)
-        解析服务</p>
+        解析服务<br><small style="color:#888">版本: ${版本号}</small></p>
     </div>
   </div>
 
