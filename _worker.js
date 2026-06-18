@@ -1,7 +1,9 @@
-let DoH = "cloudflare-dns.com";
-const jsonDoH = `https://${DoH}/resolve`;
-const dnsDoH = `https://${DoH}/dns-query`;
+﻿let DoH = "cloudflare-dns.com";
+let dnsDoH = `https://${DoH}/dns-query`;
+let jsonDoH = `https://${DoH}/resolve`;
 let DoH路径 = 'dns-query';
+const 版本号 = "custom-fix-20260619-parallel-cache";
+
 export default {
   async fetch(request, env) {
     if (env.DOH) {
@@ -11,6 +13,9 @@ export default {
         DoH = match[1];
       }
     }
+    // 根据最终 DoH 值重新计算上游地址
+    dnsDoH = `https://${DoH}/dns-query`;
+    jsonDoH = `https://${DoH}/resolve`;
     DoH路径 = env.PATH || env.TOKEN || DoH路径;//DoH路径也单独设置 变量PATH
     if (DoH路径.includes("/")) DoH路径 = DoH路径.split("/")[1];
     const url = new URL(request.url);
@@ -71,7 +76,7 @@ export default {
       }
 
       try {
-        // 使用Worker代理请求HTTP的IP API
+        // 使用Worker代理请求IP API
         const response = await fetch(`http://ip-api.com/json/${ip}?lang=zh-CN`);
 
         if (!response.ok) {
@@ -100,8 +105,7 @@ export default {
           query: ip,
           timestamp: new Date().toISOString(),
           details: {
-            errorType: error.name,
-            stack: error.stack ? error.stack.split('\n')[0] : null
+            errorType: error.name
           }
         }, null, 4), {
           status: 500,
@@ -116,6 +120,13 @@ export default {
     // 如果请求参数中包含 domain 和 doh，则执行 DNS 解析
     if (url.searchParams.has("doh")) {
       const domain = url.searchParams.get("domain") || url.searchParams.get("name") || "www.google.com";
+      // 域名格式校验
+      if (!isValidDomain(domain)) {
+        return new Response(JSON.stringify({ error: "域名格式无效", domain }, null, 2), {
+          headers: { "content-type": "application/json; charset=UTF-8", "Access-Control-Allow-Origin": "*" },
+          status: 400
+        });
+      }
       const doh = url.searchParams.get("doh") || dnsDoH;
       const type = url.searchParams.get("type") || "all"; // 默认同时查询 A 和 AAAA
 
@@ -222,8 +233,7 @@ export default {
         return new Response(JSON.stringify({
           error: `DNS 查询失败: ${err.message}`,
           doh: doh,
-          domain: domain,
-          stack: err.stack
+          domain: domain
         }, null, 2), {
           headers: { "content-type": "application/json; charset=UTF-8" },
           status: 500
@@ -244,72 +254,60 @@ export default {
   }
 }
 
+// 域名格式校验
+function isValidDomain(domain) {
+  return /^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/.test(domain);
+}
+
 // 查询DNS的通用函数
 async function queryDns(dohServer, domain, type) {
-  // 构造 DoH 请求 URL
   const dohUrl = new URL(dohServer);
   dohUrl.searchParams.set("name", domain);
   dohUrl.searchParams.set("type", type);
 
-  // 尝试多种请求头格式
-  const fetchOptions = [
-    // 标准 application/dns-json
-    {
-      headers: { 'Accept': 'application/dns-json' }
-    },
-    // 部分服务使用没有指定 Accept 头的请求
-    {
-      headers: {}
-    },
-    // 另一个尝试 application/json
-    {
-      headers: { 'Accept': 'application/json' }
-    },
-    // 稳妥起见，有些服务可能需要明确的用户代理
-    {
-      headers: {
-        'Accept': 'application/dns-json',
-        'User-Agent': 'Mozilla/5.0 DNS Client'
-      }
+  // 检查 DNS 缓存
+  // 检查 DNS 缓存（失败则跳过，不影响查询）
+  try {
+    const cacheKey = new Request(`https://doh-cache.local/${encodeURIComponent(dohServer)}/${encodeURIComponent(domain)}/${type}`);
+    const cachedResponse = await caches.default.match(cacheKey);
+    if (cachedResponse) return cachedResponse.json();
+  } catch (e) { /* 缓存不可用时跳过 */ }
+  // 并行尝试多种请求头，首个成功即返回
+  const attempts = [
+    { headers: { Accept: "application/dns-json" } },
+    { headers: {} },
+    { headers: { Accept: "application/json" } },
+    { headers: { Accept: "application/dns-json", "User-Agent": "Mozilla/5.0 DNS Client" } }
+  ].map(async (opts) => {
+    const r = await fetch(dohUrl.toString(), opts);
+    if (!r.ok) {
+      const et = await r.text();
+      throw new Error(`DoH 错误 (${r.status}): ${et.substring(0, 200)}`);
     }
-  ];
+    const ct = r.headers.get("content-type") || "";
+    if (ct.includes("json") || ct.includes("dns-json")) return r.json();
+    const txt = await r.text();
+    try { return JSON.parse(txt); }
+    catch (e) { throw new Error(`非JSON响应: ${txt.substring(0, 100)}`); }
+  });
 
-  let lastError = null;
-
-  // 依次尝试不同的请求头组合
-  for (const options of fetchOptions) {
-    try {
-      const response = await fetch(dohUrl.toString(), options);
-
-      // 如果请求成功，解析JSON
-      if (response.ok) {
-        const contentType = response.headers.get('content-type') || '';
-        // 检查内容类型是否兼容
-        if (contentType.includes('json') || contentType.includes('dns-json')) {
-          return await response.json();
-        } else {
-          // 对于非标准的响应，仍尝试进行解析
-          const textResponse = await response.text();
-          try {
-            return JSON.parse(textResponse);
-          } catch (jsonError) {
-            throw new Error(`无法解析响应为JSON: ${jsonError.message}, 响应内容: ${textResponse.substring(0, 100)}`);
-          }
-        }
-      }
-
-      // 错误情况记录，继续尝试下一个选项
-      const errorText = await response.text();
-      lastError = new Error(`DoH 服务器返回错误 (${response.status}): ${errorText.substring(0, 200)}`);
-
-    } catch (err) {
-      // 记录错误，继续尝试下一个选项
-      lastError = err;
-    }
+  let result;
+  try { result = await Promise.any(attempts); }
+  catch (err) {
+    throw err instanceof AggregateError
+      ? new Error(`所有 DoH 查询均失败: ${err.errors.map(e => e.message).join("; ")}`)
+      : err;
   }
 
-  // 所有尝试都失败，抛出最后一个错误
-  throw lastError || new Error("无法完成 DNS 查询");
+  // 写入缓存（按 Answer TTL，最长 300 秒）
+  const records = result.Answer || [];
+  const ttls = records.map(r => r.TTL).filter(t => t > 0);
+  const ttl = ttls.length > 0 ? Math.min(Math.min(...ttls), 300) : 60;
+  const cr = new Response(JSON.stringify(result), {
+    headers: { "Content-Type": "application/json", "Cache-Control": `max-age=${ttl}` }
+  });
+  try { await caches.default.put(cacheKey, cr); } catch (e) { /* 缓存写入失败，忽略 */ }
+  return result;
 }
 
 // 处理本地 DoH 请求的函数 - 直接调用 DoH，而不是自身服务
@@ -380,8 +378,7 @@ async function handleLocalDohRequest(domain, type, hostname) {
   } catch (err) {
     console.error("DoH 查询失败:", err);
     return new Response(JSON.stringify({
-      error: `DoH 查询失败: ${err.message}`,
-      stack: err.stack
+      error: `DoH 查询失败: ${err.message}`
     }, null, 2), {
       headers: {
         "content-type": "application/json; charset=UTF-8",
@@ -418,19 +415,18 @@ async function DOHRequest(request) {
     if (method === 'GET' && searchParams.has('name')) {
       const searchDoH = searchParams.has('type') ? url.search : url.search + '&type=A';
       // 处理 JSON 格式的 DoH 请求
-      response = await fetch(dnsDoH + searchDoH, {
-        headers: {
-          'Accept': 'application/dns-json',
-          'User-Agent': UA
-        }
-      });
-      // 如果 DoHUrl 请求非成功（状态码 200），则再请求 jsonDoH
-      if (!response.ok) response = await fetch(jsonDoH + searchDoH, {
-        headers: {
-          'Accept': 'application/dns-json',
-          'User-Agent': UA
-        }
-      });
+      // 并行请求 dnsDoH / jsonDoH，先成功者胜出
+      const fOpts = { headers: { Accept: "application/dns-json", "User-Agent": UA } };
+      try {
+        response = await Promise.any([
+          fetch(dnsDoH + searchDoH, fOpts).then(r => r.ok ? r : Promise.reject(r)),
+          fetch(jsonDoH + searchDoH, fOpts).then(r => r.ok ? r : Promise.reject(r))
+        ]);
+      } catch (e) {
+        response = (e instanceof AggregateError && e.errors[0] instanceof Response)
+          ? e.errors[0]
+          : new Response("DoH 上游全部不可用", { status: 502 });
+      }
     } else if (method === 'GET') {
       // 处理 base64url 格式的 GET 请求
       response = await fetch(dnsDoH + url.search, {
@@ -489,8 +485,7 @@ async function DOHRequest(request) {
   } catch (error) {
     console.error("DoH 请求处理错误:", error);
     return new Response(JSON.stringify({
-      error: `DoH 请求处理错误: ${error.message}`,
-      stack: error.stack
+      error: `DoH 请求处理错误: ${error.message}`
     }, null, 4), {
       status: 500,
       headers: {
@@ -1017,7 +1012,7 @@ async function HTML() {
     <div class="beian-info">
       <p><strong>DNS-over-HTTPS：<span id="dohUrlDisplay" class="copy-link" title="点击复制">https://<span
               id="currentDomain">...</span>/${DoH路径}</span></strong><br>基于 Cloudflare Workers 上游 ${DoH} 的 DoH (DNS over HTTPS)
-        解析服务</p>
+        解析服务<br><small style="color:#888">版本: ${版本号}</small></p>
     </div>
   </div>
 
@@ -1603,7 +1598,6 @@ async function 代理URL(代理网址, 目标网址) {
 
   // 解析目标 URL
   const 解析后的网址 = new URL(完整网址);
-  console.log(解析后的网址);
   // 提取并可能修改 URL 组件
   const 协议 = 解析后的网址.protocol.slice(0, -1) || 'https';
   const 主机名 = 解析后的网址.hostname;
@@ -1640,7 +1634,7 @@ async function 代理URL(代理网址, 目标网址) {
 async function 整理(内容) {
   // 将制表符、双引号、单引号和换行符都替换为逗号
   // 然后将连续的多个逗号替换为单个逗号
-  var 替换后的内容 = 内容.replace(/[	|"'\r\n]+/g, ',').replace(/,+/g, ',');
+  let 替换后的内容 = 内容.replace(/[	"'\r\n]+/g, ',').replace(/,+/g, ',');
 
   // 删除开头和结尾的逗号（如果有的话）
   if (替换后的内容.charAt(0) == ',') 替换后的内容 = 替换后的内容.slice(1);
