@@ -1,26 +1,14 @@
-﻿let DoH = "cloudflare-dns.com";
-let dnsDoH = `https://${DoH}/dns-query`;
-let jsonDoH = `https://${DoH}/resolve`;
-let DoH路径 = 'dns-query';
-const 版本号 = "custom-fix-20260619-parallel-cache";
+const 版本号 = "custom-fix-20261020-personal-fix-2";
 
 export default {
   async fetch(request, env) {
-    if (env.DOH) {
-      DoH = env.DOH;
-      const match = DoH.match(/:\/\/([^\/]+)/);
-      if (match) {
-        DoH = match[1];
-      }
-    }
-    // 根据最终 DoH 值重新计算上游地址
-    dnsDoH = `https://${DoH}/dns-query`;
-    jsonDoH = `https://${DoH}/resolve`;
-    DoH路径 = env.PATH || env.TOKEN || DoH路径;//DoH路径也单独设置 变量PATH
+    const DoH = (env.DOH || "cloudflare-dns.com").replace(/^https?:\/\//, '').split('/')[0];
+    const dnsDoH = `https://${DoH}/dns-query`;
+    const jsonDoH = `https://${DoH}/resolve`;
+    let DoH路径 = env.PATH || env.TOKEN || 'dns-query';
     if (DoH路径.includes("/")) DoH路径 = DoH路径.split("/")[1];
     const url = new URL(request.url);
     const path = url.pathname;
-    const hostname = url.hostname;
 
     // 处理 OPTIONS 预检请求
     if (request.method === 'OPTIONS') {
@@ -36,7 +24,7 @@ export default {
 
     // 如果请求路径，则作为 DoH 服务器处理
     if (path === `/${DoH路径}`) {
-      return await DOHRequest(request);
+      return await DOHRequest(request, dnsDoH, jsonDoH);
     }
 
     // 添加IP地理位置信息查询代理
@@ -129,19 +117,31 @@ export default {
       }
       const doh = url.searchParams.get("doh") || dnsDoH;
       const type = url.searchParams.get("type") || "all"; // 默认同时查询 A 和 AAAA
+      let dohUrl;
+      try {
+        dohUrl = new URL(doh);
+        if (dohUrl.protocol !== 'https:' || dohUrl.username || dohUrl.password) throw new Error();
+      } catch {
+        return new Response(JSON.stringify({ error: "DoH 地址必须是 HTTPS URL" }), {
+          status: 400,
+          headers: { "content-type": "application/json; charset=UTF-8" }
+        });
+      }
 
       // 如果使用的是当前站点，则使用 DoH 服务
-      if (doh.includes(url.host)) {
-        return await handleLocalDohRequest(domain, type, hostname);
+      if (dohUrl.origin === url.origin) {
+        return await handleLocalDohRequest(domain, type, dnsDoH);
       }
 
       try {
         // 根据请求类型进行不同的处理
         if (type === "all") {
           // 同时请求 A、AAAA 和 NS 记录，使用新的查询函数
-          const ipv4Result = await queryDns(doh, domain, "A");
-          const ipv6Result = await queryDns(doh, domain, "AAAA");
-          const nsResult = await queryDns(doh, domain, "NS");
+          const [ipv4Result, ipv6Result, nsResult] = await Promise.all([
+            queryDns(doh, domain, "A"),
+            queryDns(doh, domain, "AAAA"),
+            queryDns(doh, domain, "NS")
+          ]);
 
           // 合并结果 - 修改Question字段处理方式以兼容不同格式
           const combinedResult = {
@@ -250,7 +250,7 @@ export default {
           },
         });
       } else return await 代理URL(env.URL, url);
-    } else return await HTML();
+    } else return await HTML(DoH, DoH路径, env.TOKEN === DoH路径 ? DoH路径 : '');
   }
 }
 
@@ -265,53 +265,48 @@ async function queryDns(dohServer, domain, type) {
   dohUrl.searchParams.set("name", domain);
   dohUrl.searchParams.set("type", type);
 
-  // 检查 DNS 缓存
-  // 检查 DNS 缓存（失败则跳过，不影响查询）
+  const cacheKey = new Request(`https://doh-cache.local/${encodeURIComponent(dohServer)}/${encodeURIComponent(domain)}/${encodeURIComponent(type)}`);
+  // 缓存不可用时继续查询上游
   try {
-    const cacheKey = new Request(`https://doh-cache.local/${encodeURIComponent(dohServer)}/${encodeURIComponent(domain)}/${type}`);
     const cachedResponse = await caches.default.match(cacheKey);
     if (cachedResponse) return cachedResponse.json();
   } catch (e) { /* 缓存不可用时跳过 */ }
-  // 并行尝试多种请求头，首个成功即返回
-  const attempts = [
-    { headers: { Accept: "application/dns-json" } },
-    { headers: {} },
-    { headers: { Accept: "application/json" } },
-    { headers: { Accept: "application/dns-json", "User-Agent": "Mozilla/5.0 DNS Client" } }
-  ].map(async (opts) => {
-    const r = await fetch(dohUrl.toString(), opts);
-    if (!r.ok) {
-      const et = await r.text();
-      throw new Error(`DoH 错误 (${r.status}): ${et.substring(0, 200)}`);
-    }
-    const ct = r.headers.get("content-type") || "";
-    if (ct.includes("json") || ct.includes("dns-json")) return r.json();
-    const txt = await r.text();
-    try { return JSON.parse(txt); }
-    catch (e) { throw new Error(`非JSON响应: ${txt.substring(0, 100)}`); }
-  });
-
   let result;
-  try { result = await Promise.any(attempts); }
-  catch (err) {
-    throw err instanceof AggregateError
-      ? new Error(`所有 DoH 查询均失败: ${err.errors.map(e => e.message).join("; ")}`)
-      : err;
+  for (const accept of ["application/dns-json", "application/json"]) {
+    let response;
+    try {
+      response = await fetch(dohUrl.toString(), { headers: { Accept: accept } });
+    } catch (error) {
+      if (accept === "application/dns-json") continue;
+      throw error;
+    }
+    if (!response.ok) {
+      if (accept === "application/dns-json") continue;
+      throw new Error(`DoH 错误 (${response.status}): ${(await response.text()).substring(0, 200)}`);
+    }
+    try {
+      result = await response.json();
+      break;
+    } catch (error) {
+      if (accept === "application/json") throw error;
+    }
   }
 
   // 写入缓存（按 Answer TTL，最长 300 秒）
   const records = result.Answer || [];
   const ttls = records.map(r => r.TTL).filter(t => t > 0);
-  const ttl = ttls.length > 0 ? Math.min(Math.min(...ttls), 300) : 60;
-  const cr = new Response(JSON.stringify(result), {
-    headers: { "Content-Type": "application/json", "Cache-Control": `max-age=${ttl}` }
-  });
-  try { await caches.default.put(cacheKey, cr); } catch (e) { /* 缓存写入失败，忽略 */ }
+  if (ttls.length) {
+    const ttl = Math.min(Math.min(...ttls), 300);
+    const cr = new Response(JSON.stringify(result), {
+      headers: { "Content-Type": "application/json", "Cache-Control": `max-age=${ttl}` }
+    });
+    try { await caches.default.put(cacheKey, cr); } catch (e) { /* 缓存写入失败，忽略 */ }
+  }
   return result;
 }
 
 // 处理本地 DoH 请求的函数 - 直接调用 DoH，而不是自身服务
-async function handleLocalDohRequest(domain, type, hostname) {
+async function handleLocalDohRequest(domain, type, dnsDoH) {
   try {
     if (type === "all") {
       // 同时请求 A、AAAA 和 NS 记录
@@ -390,7 +385,7 @@ async function handleLocalDohRequest(domain, type, hostname) {
 }
 
 // DoH 请求处理函数
-async function DOHRequest(request) {
+async function DOHRequest(request, dnsDoH, jsonDoH) {
   const { method, headers, body } = request;
   const UA = headers.get('User-Agent') || 'DoH Client';
   const url = new URL(request.url);
@@ -415,18 +410,12 @@ async function DOHRequest(request) {
     if (method === 'GET' && searchParams.has('name')) {
       const searchDoH = searchParams.has('type') ? url.search : url.search + '&type=A';
       // 处理 JSON 格式的 DoH 请求
-      // 并行请求 dnsDoH / jsonDoH，先成功者胜出
+      // 优先标准端点，失败时回退到 JSON 端点
       const fOpts = { headers: { Accept: "application/dns-json", "User-Agent": UA } };
       try {
-        response = await Promise.any([
-          fetch(dnsDoH + searchDoH, fOpts).then(r => r.ok ? r : Promise.reject(r)),
-          fetch(jsonDoH + searchDoH, fOpts).then(r => r.ok ? r : Promise.reject(r))
-        ]);
-      } catch (e) {
-        response = (e instanceof AggregateError && e.errors[0] instanceof Response)
-          ? e.errors[0]
-          : new Response("DoH 上游全部不可用", { status: 502 });
-      }
+        response = await fetch(dnsDoH + searchDoH, fOpts);
+      } catch (error) { /* 回退到 JSON 端点 */ }
+      if (!response?.ok) response = await fetch(jsonDoH + searchDoH, fOpts);
     } else if (method === 'GET') {
       // 处理 base64url 格式的 GET 请求
       response = await fetch(dnsDoH + url.search, {
@@ -458,11 +447,6 @@ async function DOHRequest(request) {
       });
     }
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`DoH 返回错误 (${response.status}): ${errorText.substring(0, 200)}`);
-    }
-
     // 创建一个新的响应头对象
     const responseHeaders = new Headers(response.headers);
     // 设置跨域资源共享 (CORS) 的头部信息
@@ -487,7 +471,7 @@ async function DOHRequest(request) {
     return new Response(JSON.stringify({
       error: `DoH 请求处理错误: ${error.message}`
     }, null, 4), {
-      status: 500,
+      status: 502,
       headers: {
         'Content-Type': 'application/json',
         'Access-Control-Allow-Origin': '*'
@@ -496,7 +480,7 @@ async function DOHRequest(request) {
   }
 }
 
-async function HTML() {
+async function HTML(DoH, DoH路径, token) {
   // 否则返回 HTML 页面
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1013,6 +997,7 @@ async function HTML() {
       <p><strong>DNS-over-HTTPS：<span id="dohUrlDisplay" class="copy-link" title="点击复制">https://<span
               id="currentDomain">...</span>/${DoH路径}</span></strong><br>基于 Cloudflare Workers 上游 ${DoH} 的 DoH (DNS over HTTPS)
         解析服务<br><small style="color:#888">版本: ${版本号}</small></p>
+      <p><small style="color:#888">Modified by <a href="https://github.com/FisheeHei/CF-Workers-DoH/tree/custom-fix" target="_blank" style="color:#888">FisheeHei + custom-fix</a></small></p>
     </div>
   </div>
 
@@ -1024,6 +1009,7 @@ async function HTML() {
     const currentProtocol = window.location.protocol;
     const currentDohPath = '${DoH路径}';
     const currentDohUrl = currentProtocol + '//' + currentHost + '/' + currentDohPath;
+    const ipInfoToken = new URLSearchParams(window.location.search).get('token') || ${JSON.stringify(token).replace(/</g, '\\u003c')};
 
     // 记录当前使用的 DoH 地址
     let activeDohUrl = currentDohUrl;
@@ -1102,11 +1088,19 @@ async function HTML() {
       return Math.floor(seconds / 86400) + '天';
     }
 
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, char => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      })[char]);
+    }
+
     // 查询 IP 地理位置信息 - 使用我们自己的代理API而非直接访问HTTP地址
     async function queryIpGeoInfo(ip) {
       try {
         // 改为使用我们自己的代理接口
-        const response = await fetch(\`./ip-info?ip=\${ip}&token=${DoH路径}\`);
+        const params = new URLSearchParams({ ip });
+        if (ipInfoToken) params.set('token', ipInfoToken);
+        const response = await fetch('./ip-info?' + params);
             if (!response.ok) {
               throw new Error(\`HTTP 错误: \${response.status}\`);
             }
@@ -1155,7 +1149,7 @@ async function HTML() {
               if (record.type === 5) { // CNAME 记录
                 recordDiv.innerHTML = \`
                   <div class="d-flex justify-content-between align-items-center">
-                    <span class="ip-address" data-copy="\${record.data}">\${record.data}</span>
+                    <span class="ip-address" data-copy="\${escapeHtml(record.data)}">\${escapeHtml(record.data)}</span>
                     <span class="badge bg-success">CNAME</span>
                     <span class="text-muted ttl-info">TTL: \${formatTTL(record.TTL)}</span>
                   </div>
@@ -1171,7 +1165,7 @@ async function HTML() {
               } else if (record.type === 1) {  // A记录
                 recordDiv.innerHTML = \`
                   <div class="d-flex justify-content-between align-items-center">
-                    <span class="ip-address" data-copy="\${record.data}">\${record.data}</span>
+                    <span class="ip-address" data-copy="\${escapeHtml(record.data)}">\${escapeHtml(record.data)}</span>
                     <span class="geo-info geo-loading">正在获取位置信息...</span>
                     <span class="text-muted ttl-info">TTL: \${formatTTL(record.TTL)}</span>
                   </div>
@@ -1263,7 +1257,7 @@ async function HTML() {
               if (record.type === 5) { // CNAME 记录
                 recordDiv.innerHTML = \`
                   <div class="d-flex justify-content-between align-items-center">
-                    <span class="ip-address" data-copy="\${record.data}">\${record.data}</span>
+                    <span class="ip-address" data-copy="\${escapeHtml(record.data)}">\${escapeHtml(record.data)}</span>
                     <span class="badge bg-success">CNAME</span>
                     <span class="text-muted ttl-info">TTL: \${formatTTL(record.TTL)}</span>
                   </div>
@@ -1279,7 +1273,7 @@ async function HTML() {
               } else if (record.type === 28) {  // AAAA记录
                 recordDiv.innerHTML = \`
                   <div class="d-flex justify-content-between align-items-center">
-                    <span class="ip-address" data-copy="\${record.data}">\${record.data}</span>
+                    <span class="ip-address" data-copy="\${escapeHtml(record.data)}">\${escapeHtml(record.data)}</span>
                     <span class="geo-info geo-loading">正在获取位置信息...</span>
                     <span class="text-muted ttl-info">TTL: \${formatTTL(record.TTL)}</span>
                   </div>
@@ -1372,7 +1366,7 @@ async function HTML() {
               if (record.type === 2) {  // NS 记录
                 recordDiv.innerHTML = \`
                   <div class="d-flex justify-content-between align-items-center">
-                    <span class="ip-address" data-copy="\${record.data}">\${record.data}</span>
+                    <span class="ip-address" data-copy="\${escapeHtml(record.data)}">\${escapeHtml(record.data)}</span>
                     <span class="badge bg-info">NS</span>
                     <span class="text-muted ttl-info">TTL: \${formatTTL(record.TTL)}</span>
                   </div>
@@ -1386,23 +1380,23 @@ async function HTML() {
                 
               } else if (record.type === 6) {  // SOA 记录
                 // SOA 记录格式: primary_ns admin_email serial refresh retry expire minimum
-                const soaParts = record.data.split(' ');
-                let adminEmail = soaParts[1].replace('.', '@');
+                const soaParts = String(record.data || '').split(' ');
+                let adminEmail = (soaParts[1] || '').replace('.', '@');
                 if (adminEmail.endsWith('.')) adminEmail = adminEmail.slice(0, -1);
                 recordDiv.innerHTML = \`
                   <div class="d-flex justify-content-between align-items-center mb-2">
-                    <span class="ip-address" data-copy="\${record.name}">\${record.name}</span>
+                    <span class="ip-address" data-copy="\${escapeHtml(record.name)}">\${escapeHtml(record.name)}</span>
                     <span class="badge bg-warning">SOA</span>
                     <span class="text-muted ttl-info">TTL: \${formatTTL(record.TTL)}</span>
                   </div>
                   <div class="ps-3 small">
-                    <div><strong>主 NS:</strong> <span class="ip-address" data-copy="\${soaParts[0]}">\${soaParts[0]}</span></div>
-                    <div><strong>管理邮箱:</strong> <span class="ip-address" data-copy="\${adminEmail}">\${adminEmail}</span></div>
-                    <div><strong>序列号:</strong> \${soaParts[2]}</div>
-                    <div><strong>刷新间隔:</strong> \${formatTTL(soaParts[3])}</div>
-                    <div><strong>重试间隔:</strong> \${formatTTL(soaParts[4])}</div>
-                    <div><strong>过期时间:</strong> \${formatTTL(soaParts[5])}</div>
-                    <div><strong>最小 TTL:</strong> \${formatTTL(soaParts[6])}</div>
+                    <div><strong>主 NS:</strong> <span class="ip-address" data-copy="\${escapeHtml(soaParts[0])}">\${escapeHtml(soaParts[0])}</span></div>
+                    <div><strong>管理邮箱:</strong> <span class="ip-address" data-copy="\${escapeHtml(adminEmail)}">\${escapeHtml(adminEmail)}</span></div>
+                    <div><strong>序列号:</strong> \${escapeHtml(soaParts[2])}</div>
+                    <div><strong>刷新间隔:</strong> \${escapeHtml(formatTTL(soaParts[3]))}</div>
+                    <div><strong>重试间隔:</strong> \${escapeHtml(formatTTL(soaParts[4]))}</div>
+                    <div><strong>过期时间:</strong> \${escapeHtml(formatTTL(soaParts[5]))}</div>
+                    <div><strong>最小 TTL:</strong> \${escapeHtml(formatTTL(soaParts[6]))}</div>
                   </div>
                 \`;
                 
@@ -1418,8 +1412,8 @@ async function HTML() {
                 // 其他类型的记录
                 recordDiv.innerHTML = \`
                   <div class="d-flex justify-content-between align-items-center">
-                    <span class="ip-address" data-copy="\${record.data}">\${record.data}</span>
-                    <span class="badge bg-secondary">类型: \${record.type}</span>
+                    <span class="ip-address" data-copy="\${escapeHtml(record.data)}">\${escapeHtml(record.data)}</span>
+                    <span class="badge bg-secondary">类型: \${escapeHtml(record.type)}</span>
                     <span class="text-muted ttl-info">TTL: \${formatTTL(record.TTL)}</span>
                   </div>
                 \`;

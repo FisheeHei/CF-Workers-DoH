@@ -35,6 +35,22 @@ https://doh.cmliussss.hidns.co:2053/dns-query
 ```url
 https://doh.cmliussss.hidns.co/CMLiussss
 ```
+
+### Clash / Mihomo 使用自定义域
+
+先在 Cloudflare 为 Worker 或 Pages 绑定自定义域，再将客户端 DoH 地址设为实际域名和路径（设置 `PATH` 时优先用 `PATH`，否则用 `TOKEN` 或默认的 `dns-query`）：
+
+```yaml
+dns:
+  enable: true
+  default-nameserver:
+    - 223.5.5.5
+  nameserver:
+    - https://dns.example.com/dns-query
+```
+
+`default-nameserver` 用于先解析 `dns.example.com`，应换成你网络中可达的 DNS，不能只填这个 DoH 地址，否则会循环依赖。客户端无法连接时，先检查域名解析、HTTPS 证书，以及 Cloudflare 安全规则是否对 DoH 路径返回了挑战页面；这些发生在请求到达 Worker 之前，代码无法修复。
+
 ### 2️⃣ 附加功能 IP信息查询
 
 #### 🔍 查询当前IP信息
@@ -87,6 +103,7 @@ https://doh.cmliussss.hidns.co/ip-info?ip=8.8.8.8&token=CMLiussss
 |--|--|--|--|
 | DOH | `dns.google` |❌| 设置上游DoH服务（默认：`cloudflare-dns.com`） |
 | TOKEN | `dns-query` |❌| 设置请求DoH服务路径（默认：`/dns-query`） |
+| PATH | `dns-query` |❌| 单独设置 DoH 路径，优先于 `TOKEN` |
 | URL | `https://www.baidu.com/` |❌| 主页伪装（设为`nginx`则伪装为nginx默认页面） |
 | URL302 | `https://t.me/CMLiussss` |❌| 主页302跳转（与`URL`变量同时存在时优先执行`URL302`）|
 
