@@ -40,7 +40,7 @@ assert.equal((await request('/dns-query', { method: 'POST', body: 'query' })).st
 
 const configured = { DOH: 'https://dns.google/', PATH: 'private', TOKEN: 'different' };
 const page = await (await worker.fetch(new Request('https://example.net/'), configured)).text();
-assert.match(page, /custom-fix-20261020-personal-fix/);
+assert.match(page, /custom-fix-20261020-personal-fix-1/);
 assert.doesNotMatch(page, /const ipInfoToken = .*different/);
 assert.match(page, /const ipInfoToken = .*get\('token'\) \|\| ""/);
 assert.match(page, /const currentDohPath = 'private'/);

@@ -1,4 +1,4 @@
-const 版本号 = "custom-fix-20261020-personal-fix";
+const 版本号 = "custom-fix-20261020-personal-fix-1";
 
 export default {
   async fetch(request, env) {
