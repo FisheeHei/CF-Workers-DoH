@@ -1,4 +1,4 @@
-const 版本号 = "custom-fix-20261020-personal-fix-1";
+const 版本号 = "custom-fix-20261020-personal-fix-2";
 
 export default {
   async fetch(request, env) {
@@ -447,11 +447,6 @@ async function DOHRequest(request, dnsDoH, jsonDoH) {
       });
     }
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`DoH 返回错误 (${response.status}): ${errorText.substring(0, 200)}`);
-    }
-
     // 创建一个新的响应头对象
     const responseHeaders = new Headers(response.headers);
     // 设置跨域资源共享 (CORS) 的头部信息
@@ -476,7 +471,7 @@ async function DOHRequest(request, dnsDoH, jsonDoH) {
     return new Response(JSON.stringify({
       error: `DoH 请求处理错误: ${error.message}`
     }, null, 4), {
-      status: 500,
+      status: 502,
       headers: {
         'Content-Type': 'application/json',
         'Access-Control-Allow-Origin': '*'

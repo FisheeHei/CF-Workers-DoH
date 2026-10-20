@@ -40,7 +40,7 @@ assert.equal((await request('/dns-query', { method: 'POST', body: 'query' })).st
 
 const configured = { DOH: 'https://dns.google/', PATH: 'private', TOKEN: 'different' };
 const page = await (await worker.fetch(new Request('https://example.net/'), configured)).text();
-assert.match(page, /custom-fix-20261020-personal-fix-1/);
+assert.match(page, /custom-fix-20261020-personal-fix-2/);
 assert.doesNotMatch(page, /const ipInfoToken = .*different/);
 assert.match(page, /const ipInfoToken = .*get\('token'\) \|\| ""/);
 assert.match(page, /const currentDohPath = 'private'/);
@@ -61,5 +61,19 @@ globalThis.fetch = async (url, options) => {
 };
 assert.equal((await request('/dns-query?name=example.com&type=A')).status, 200);
 assert.ok(calls.at(-1).url.includes('/resolve?'), 'failed primary should fall back once');
+
+globalThis.fetch = async () => new Response('upstream busy', { status: 503 });
+const unavailable = await request('/dns-query?dns=AA');
+assert.equal(unavailable.status, 503);
+assert.equal(await unavailable.text(), 'upstream busy');
+
+globalThis.fetch = async () => { throw new Error('network unavailable'); };
+const originalError = console.error;
+try {
+  console.error = () => {};
+  assert.equal((await request('/dns-query', { method: 'POST', body: 'query' })).status, 502);
+} finally {
+  console.error = originalError;
+}
 
 console.log('Worker routes, cache, configuration and page script: OK');
